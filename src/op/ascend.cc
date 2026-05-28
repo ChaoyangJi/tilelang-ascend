@@ -57,6 +57,18 @@ AscendCopy::AscendCopy(Array<PrimExpr> args, BufferMap vmap) : args_(args) {
   } else {
     padValue = Integer(0);
   }
+  // Handle tmp parameter: check if it's a valid region (not IntImm(0) marker)
+  if (args.size() >= 6) {
+    auto tmp_expr = args[5];
+    // Check if tmp is a Call (valid region) or IntImm (none marker)
+    if (auto *tmp_call = tmp_expr.as<CallNode>()) {
+      auto tmp_region = RegionOp(tmp_call->args, vmap);
+      this->tmp = tmp_region.GetBuffer();
+      this->tmp_range = tmp_region.GetRanges();
+      this->tmp_extents = tmp_region.GetExtents();
+    }
+    // If tmp_expr is IntImm(0), leave tmp as undefined (default)
+  }
   std::tie(this->src, this->dst) = std::tie(bf[0], bf[1]);
   std::tie(this->src_range, this->dst_range) = std::tie(rgs[0], rgs[1]);
   std::tie(this->src_extents, this->dst_extents) = std::tie(ets[0], ets[1]);
@@ -475,6 +487,21 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       2, dst_new_buffer->dtype, 1,
       dst_new_buffer.OffsetOf(dst_new_indices).back(), dst_len);
 
+  PrimExpr tmp_ptr;
+  if (tmp.defined()) {
+    auto tmp_new_indices = T.layout_map.count(tmp)
+                               ? T.layout_map[tmp]->Forward(build_indices(tmp_range))
+                               : build_indices(tmp_range);
+    auto tmp_new_buffer = T.buffer_remap.count(tmp) ? T.buffer_remap[tmp] : tmp;
+    PrimExpr tmp_len = 1;
+    for (auto &shape : tmp_extents) {
+      tmp_len *= shape;
+    }
+    tmp_ptr = tmp_new_buffer.access_ptr(
+        3, tmp_new_buffer->dtype, 1,
+        tmp_new_buffer.OffsetOf(tmp_new_indices).back(), tmp_len);
+  }
+
   auto compute_valid_extent = [](PrimExpr min_val, PrimExpr extent,
                                  PrimExpr shape) -> PrimExpr {
     PrimExpr remaining = shape - min_val;
@@ -621,6 +648,10 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         src->shape[src->shape.size() -
                    1]); // ub/l0c -> gm need realdstN which is equal to srcN in
                         // virtural channel scenario
+    // Add tmp buffer for UB->L1 copy on A5 (for ND->NZ conversion)
+    if (tmp.defined()) {
+      new_args.push_back(tmp_ptr);
+    }
   }
   // if (config.l12l0) {
   //   ICHECK(src->shape.size() == dst->shape.size());

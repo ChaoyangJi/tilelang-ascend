@@ -67,6 +67,10 @@ struct CopyGlobalContext {
     std::string dtype_str;
     int M_val;
     int N_val;
+    // Tmp buffer shape for ND->NZ conversion (A5 only)
+    bool has_tmp = false;
+    int tmp_M_val = 0;
+    int tmp_N_val = 0;
   };
   std::unordered_map<std::string, PipeInfo> pipe_info_map_;
 };
@@ -492,6 +496,33 @@ public:
           info.M_val = std::stoi(params[2]);
           info.dir_type = 2;
           info.op_name = "copy_pipe_to_l1";
+
+          // Check if tmp buffer is provided for A5 (ND->NZ conversion)
+          // After AscendCopy::Lower, args layout: [0]=func_name, [1]=src_ptr, [2]=dst_ptr, [3]=srcN, [4]=tmp_ptr
+          if (call_node->args.size() > 4) {
+            PrimExpr tmp_expr = call_node->args[4];
+            if (auto *tmp_call = tmp_expr.as<CallNode>()) {
+              // Extract tmp buffer shape from buffer_shapes_
+              const VarNode *tmp_var = tmp_call->args[1].as<VarNode>();
+              if (tmp_var) {
+                std::string tmp_buffer_name = tmp_var->name_hint;
+                auto shape_it = context_.buffer_shapes_.find(tmp_buffer_name);
+                if (shape_it != context_.buffer_shapes_.end()) {
+                  Array<PrimExpr> tmp_shape = shape_it->second;
+                  if (tmp_shape.size() >= 2) {
+                    // Assume shape is [M, N]
+                    auto *M_imm = tmp_shape[0].as<IntImmNode>();
+                    auto *N_imm = tmp_shape[1].as<IntImmNode>();
+                    if (M_imm && N_imm) {
+                      info.has_tmp = true;
+                      info.tmp_M_val = M_imm->value;
+                      info.tmp_N_val = N_imm->value;
+                    }
+                  }
+                }
+              }
+            }
+          }
         } else {
           ICHECK(params.size() >= 5)
               << "[Error]<WorkspaceReduction> PTO: copy_l0c_to_ub template expects 5+ params, got "
@@ -672,13 +703,31 @@ private:
     std::string pipe_op1 =
         is_ub_to_l1 ? "copy_ub_to_pipe" : "copy_l0c_to_pipe";
 
+    // Build template parameters
     std::stringstream ss1;
     ss1 << "tl::ascend::" << pipe_op1 << "<" << pipe.dtype_str << ", "
-        << pipe.M_val << ", " << pipe.N_val << ">";
+        << pipe.M_val << ", " << pipe.N_val;
+    
+    // Add tmp shape template parameters if present (A5 ND->NZ conversion)
+    if (is_ub_to_l1 && pipe.has_tmp) {
+      ss1 << ", " << pipe.tmp_M_val << ", " << pipe.tmp_N_val;
+    }
+    ss1 << ">";
+
     Array<PrimExpr> args1 = {StringImm(ss1.str()), src_ptr, dst_ptr,
                              Integer(pipe.flag_id), Integer(pipe.dir_type),
                              Integer(pipe.slot_size), Integer(pipe.slot_num),
                              StringImm(pipe.pipe_id)};
+    
+    // Add tmp buffer argument if present (A5 UB->L1 with ND->NZ conversion)
+    if (is_ub_to_l1 && pipe.has_tmp && args.size() > 4) {
+      PrimExpr tmp_expr = args[4];
+      // Only add tmp if it's a valid Call (not IntImm marker)
+      if (tmp_expr.as<CallNode>()) {
+        args1.push_back(tmp_expr);
+      }
+    }
+    
     Call call1(DataType::Handle(), tir::builtin::call_extern(), args1);
 
     return Evaluate(call1);

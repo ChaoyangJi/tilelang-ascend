@@ -1245,7 +1245,19 @@ void CodeGenTileLangAscendPto::CopyPipeCodegen(const CallNode *op,
 
   this->PrintIndent();
   if (is_producer) {
-    this->stream << func_call << "(" << pipe_id << ", " << src_name << ");\n";
+    // Check if tmp buffer is provided (args.size() > 8 and args[8] is a Call)
+    if (op->args.size() > 8 && op->args[8].as<CallNode>()) {
+      BufferInfo tmp_info = GetBufferInfo(op->args[8]);
+      ShapeInfo tmp_shape_info = GetSliceInfo(tmp_info.access_ptr);
+      std::string tmp_name = tmp_shape_info.ub_name;
+      if (tmp_shape_info.is_slice) {
+        tmp_name = GetTempVarName(tmp_shape_info.ub_name);
+        CreateUbVariableND(tmp_name, tmp_shape_info);
+      }
+      this->stream << func_call << "(" << pipe_id << ", " << src_name << ", " << tmp_name << ");\n";
+    } else {
+      this->stream << func_call << "(" << pipe_id << ", " << src_name << ");\n";
+    }
   } else {
     this->stream << func_call << "(" << pipe_id << ", " << dst_name << ");\n";
   }
