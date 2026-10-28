@@ -202,6 +202,26 @@ jobs:
           pytest_files_array=()
           pytest_dirs_array=()
 
+          # A migrated operator is covered by its Pytest test, so a change to either
+          # one only needs that test; there is no reason to run the whole directory.
+          declare -A source_to_test=()
+          declare -A test_to_test=()
+          # Collected separately from pytest_files_array: that one is for
+          # testing/python/ and gets collapsed by rules further down. Every rule
+          # that decides on a full run clears these along with the rest, or what
+          # was collected before it would be written back afterwards and narrow
+          # the full run to the directory of whichever operator came first.
+          declare -A routed_tests=()
+          routed_example_dirs=()
+          routed_experiment_dirs=()
+          if [ -f scripts/ci/resolve_operator_tests.py ]; then
+            while IFS=$'\t' read -r source test; do
+              [[ -n "$source" && -n "$test" ]] || continue
+              source_to_test["$source"]="$test"
+              test_to_test["$test"]="$test"
+            done < <(python scripts/ci/resolve_operator_tests.py list --format tsv)
+          fi
+
           for file in $changed_files; do
             # 排除 .agents 目录（skill 配置，无需测试）
             if [[ "$file" =~ ^\.agents/ ]]; then
@@ -251,9 +271,37 @@ jobs:
               experiment_dirs_array=()
               pytest_files_array=()
               pytest_dirs_array=()
+              routed_tests=()
+              routed_example_dirs=()
+              routed_experiment_dirs=()
               break
             fi
             
+            if [[ -n "${source_to_test[$file]:-}" ]]; then
+              mapped_test="${source_to_test[$file]}"
+              routed_tests["$mapped_test"]=1
+              if [[ "$file" =~ ^examples/([^/]+)/ ]]; then
+                routed_example_dirs+=("${BASH_REMATCH[1]}")
+              elif [[ "$file" =~ ^examples_experiment/([^/]+)/ ]]; then
+                routed_experiment_dirs+=("${BASH_REMATCH[1]}")
+              fi
+              should_skip=false
+              echo "Mapped migrated operator $file -> $mapped_test"
+              continue
+            fi
+
+            if [[ -n "${test_to_test[$file]:-}" ]]; then
+              routed_tests["$file"]=1
+              if [[ "$file" =~ ^examples/([^/]+)/ ]]; then
+                routed_example_dirs+=("${BASH_REMATCH[1]}")
+              elif [[ "$file" =~ ^examples_experiment/([^/]+)/ ]]; then
+                routed_experiment_dirs+=("${BASH_REMATCH[1]}")
+              fi
+              should_skip=false
+              echo "Mapped migrated test: $file"
+              continue
+            fi
+
             # examples 文件 → 增量 examples + pytest
             if [[ "$file" =~ ^examples/([^/]+)/ ]]; then
               test_dir="${BASH_REMATCH[1]}"
@@ -298,6 +346,9 @@ jobs:
               experiment_dirs_array=()
               pytest_files_array=()
               pytest_dirs_array=()
+              routed_tests=()
+              routed_example_dirs=()
+              routed_experiment_dirs=()
               break
             fi
 
@@ -318,6 +369,9 @@ jobs:
               experiment_dirs_array=()
               pytest_files_array=()
               pytest_dirs_array=()
+              routed_tests=()
+              routed_example_dirs=()
+              routed_experiment_dirs=()
               break
             fi
             
@@ -335,6 +389,9 @@ jobs:
               experiment_dirs_array=()
               pytest_files_array=()
               pytest_dirs_array=()
+              routed_tests=()
+              routed_example_dirs=()
+              routed_experiment_dirs=()
               break
             fi
           done
@@ -359,6 +416,39 @@ jobs:
           
           test_dirs="${test_dirs_array[*]}"
           experiment_dirs="${experiment_dirs_array[*]}"
+          # Decided after the collapsing above, and overriding it: those two rules
+          # (one subdirectory replaces the list, more than three empties it) exist
+          # for testing/python/ and would drop these entries. Nothing else queued
+          # means the whole change is migrated tests, so run exactly those.
+          if [[ ${#routed_tests[@]} -gt 0 ]]; then
+            if [[ ${#pytest_files_array[@]} -eq 0 ]] \
+               && [[ ${#pytest_dirs_array[@]} -eq 0 ]] \
+               && [[ ${#test_dirs_array[@]} -eq 0 ]] \
+               && [[ ${#experiment_dirs_array[@]} -eq 0 ]] \
+               && [[ "$run_examples" == false ]]; then
+              pytest_files="${!routed_tests[*]}"
+              run_pytest_only=true
+              echo "Only migrated tests changed: ${pytest_files}"
+            else
+              run_examples=true
+              run_pytest_only=false
+              pytest_files=""
+              for routed_dir in "${routed_example_dirs[@]}"; do
+                if [[ ! " ${test_dirs_array[*]} " =~ " $routed_dir " ]]; then
+                  test_dirs_array+=("$routed_dir")
+                fi
+              done
+              for routed_dir in "${routed_experiment_dirs[@]}"; do
+                if [[ ! " ${experiment_dirs_array[*]} " =~ " $routed_dir " ]]; then
+                  experiment_dirs_array+=("$routed_dir")
+                fi
+              done
+              test_dirs="${test_dirs_array[*]}"
+              experiment_dirs="${experiment_dirs_array[*]}"
+              echo "Migrated tests alongside other changes: running examples plus every registered test"
+            fi
+          fi
+
           echo "run_examples=${run_examples}" >> $GITHUB_OUTPUT
           echo "run_pytest_only=${run_pytest_only}" >> $GITHUB_OUTPUT
           echo "test_dirs=${test_dirs}" >> $GITHUB_OUTPUT
@@ -384,7 +474,7 @@ jobs:
 
   test:
     name: Benchmark Tests (Ascend NPU)
-    runs-on: [self-hosted, Linux, X64, ascend_910b]
+    runs-on: [self-hosted, Linux, tilelang-ascend-ci]
     needs: check_changes
     outputs:
       pass_rate: ${{ steps.check_results.outputs.pass_rate }}
@@ -452,7 +542,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: build-cache/
-          key: tilelang-build-${{ github.base_ref || github.ref_name }}-${{ hashFiles('CMakeLists.txt', 'requirements.txt', 'install_ascend.sh') }}
+          key: tilelang-build-${{ runner.name }}-${{ github.base_ref || github.ref_name }}-${{ hashFiles('CMakeLists.txt', 'requirements.txt', 'install_ascend.sh') }}
       
       # 全量编译，清理所有残留编译产物
       - name: Clean build artifacts for full build
@@ -538,7 +628,15 @@ jobs:
             PYTEST_MARKERS="not (low_priority or ci_skip)"
           fi
 
+          NPU_DEVICE_ARGS=()
+
+          if [[ "${RUNNER_NAME:-}" == "ascend_cicd_a3" ]]; then
+            NPU_DEVICE_ARGS+=(-e "ASCEND_RT_VISIBLE_DEVICES=0")
+            echo "A3 runner detected: limiting Ascend runtime visibility to logical device 0"
+          fi
+
           docker exec \
+            "${NPU_DEVICE_ARGS[@]}" \
             -w $GITHUB_WORKSPACE \
             -e GITHUB_ENV=$GITHUB_ENV \
             -e GITHUB_OUTPUT=$GITHUB_OUTPUT \
@@ -561,6 +659,13 @@ jobs:
                 mkdir -p build
                 cp -ra build-cache/* build/ 
               fi
+
+              # 0. 将所有子模块重置到主仓库记录的版本，清除上次运行残留的修改（例如 TVM 补丁）
+              #    actions/checkout 只清理主仓库，self-hosted runner 上的子模块工作区会跨运行保留
+              git submodule update --init --recursive --force
+              git submodule foreach --recursive 'git reset -q --hard && git clean -qffdx'
+              # 在干净的子模块上应用 TVM 补丁；补丁无法应用时由 set -e 中止构建
+              bash 3rdparty/patches/apply_tvm_patches.sh
 
               # 1. 增量编译项目
               bash install_ascend.sh \$INCREMENTAL_FLAG
@@ -591,8 +696,14 @@ jobs:
                 # 只跑 pytest（testing/ 修改）
                 if [ -n \"\$PYTEST_FILES_ARG\" ]; then
                   echo 'Running incremental pytest for: '\$PYTEST_FILES_ARG
+                  # Prefix every path, not just the first: the value can hold several
+                  # files and the rest would otherwise resolve against examples/.
+                  PYTEST_TARGETS=()
+                  for pytest_target in \$PYTEST_FILES_ARG; do
+                    PYTEST_TARGETS+=(\"../\$pytest_target\")
+                  done
                   set +e
-                  pytest --forked ../\$PYTEST_FILES_ARG -v -n 4 \"\${PYTEST_MARKER_ARGS[@]}\" 2>&1 | tee test_output.log
+                  pytest --forked \"\${PYTEST_TARGETS[@]}\" -v -n 4 \"\${PYTEST_MARKER_ARGS[@]}\" 2>&1 | tee test_output.log
                 else
                   echo 'Running full pytest (testing/ modified)'
                   set +e
@@ -614,6 +725,27 @@ jobs:
                   fi
                 fi
                 TEST_EXIT_CODE=\${PIPESTATUS[0]}
+
+                # Operator tests were moved out of the legacy runner, so run them here:
+                # one Pytest invocation gets xdist scheduling, the marker filter and the
+                # full failure output. Entries reserved but not migrated yet are absent
+                # from list-tests, so nothing points at a file that does not exist.
+                #
+                # Scoped by the same two arguments the runner just took, so an
+                # incremental run tests the operators in the directories it ran and
+                # no others. Both are empty on a full run, which selects them all.
+                OPERATOR_TESTS=()
+                while IFS= read -r operator_test; do
+                  [ -n \"\$operator_test\" ] && OPERATOR_TESTS+=(\"../\$operator_test\")
+                done < <(python ../scripts/ci/resolve_operator_tests.py list-tests \$TEST_DIRS_ARG \$EXPERIMENT_DIRS_ARG)
+                if [ \${#OPERATOR_TESTS[@]} -gt 0 ]; then
+                  echo 'Running operator tests: '\${OPERATOR_TESTS[*]}
+                  pytest --forked \"\${OPERATOR_TESTS[@]}\" -v -n 8 \"\${PYTEST_MARKER_ARGS[@]}\" 2>&1 | tee -a test_output.log
+                  OPERATOR_EXIT_CODE=\${PIPESTATUS[0]}
+                  if [ \"\$TEST_EXIT_CODE\" -eq 0 ]; then
+                    TEST_EXIT_CODE=\$OPERATOR_EXIT_CODE
+                  fi
+                fi
                 set -e
               fi
 
@@ -629,7 +761,7 @@ jobs:
       - name: Delete old cache for overwrite
         if: always() && env.FULL_BUILD == 'true'
         run: |
-          KEY="tilelang-build-${{ github.base_ref || github.ref_name }}-${{ hashFiles('CMakeLists.txt', 'requirements.txt', 'install_ascend.sh') }}"
+          KEY="tilelang-build-${{ runner.name }}-${{ github.base_ref || github.ref_name }}-${{ hashFiles('CMakeLists.txt', 'requirements.txt', 'install_ascend.sh') }}"
           echo "🗑️ Deleting old cache to allow overwrite: $KEY"
           curl -s -L \
             -X DELETE \
@@ -647,7 +779,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: build-cache/
-          key: tilelang-build-${{ github.base_ref || github.ref_name }}-${{ hashFiles('CMakeLists.txt', 'requirements.txt', 'install_ascend.sh') }}
+          key: tilelang-build-${{ runner.name }}-${{ github.base_ref || github.ref_name }}-${{ hashFiles('CMakeLists.txt', 'requirements.txt', 'install_ascend.sh') }}
           
       - name: Check pass rate
         id: check_results
@@ -863,7 +995,7 @@ jobs:
             ---
             
             *This issue was automatically created by the daily scheduled test.*
-            *Assignees: @benyang0506, @fuhouyu-hw, @z00520135*`;
+            *Assignees: @LLMZhangYC, @ChaoyangJi, @z00520135*`;
             
             const title = `[Daily Test] ${statusEmoji} ${testSummary} - ${runDate}`;
             
@@ -872,6 +1004,6 @@ jobs:
               repo: context.repo.repo,
               title: title,
               body: body,
-              assignees: ['benyang0506', 'fuhouyu-hw', 'z00520135'],
+              assignees: ['LLMZhangYC', 'ChaoyangJi', 'z00520135'],
               labels: ['daily-test', testStatus === 'passed' ? 'test-passed' : 'test-failed']
             });

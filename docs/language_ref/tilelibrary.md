@@ -4,12 +4,10 @@ Tile Language: TileLibrary
 T.Kernel
 --------
 
-args: the grid size (0-3 dimension) and the num_threads.
-
-returns: the blockIdx variables
-
-launch a kernel, it must be used in a with statement. There can be
-multiple kernels launched sequentially inside a prim function.
+On Ascend, `T.Kernel` takes one block dimension. Fold a multidimensional task
+space into that value and recover the logical indices from `cid` inside the
+kernel. Developer-mode `threads` may be `1` or `2`; the Expert launch form
+omits `threads` and binds `(cid, vid)`.
 
 T.alloc_shared
 --------------
@@ -61,10 +59,40 @@ Note that the current implementation has some shape and dtype
 constraints, for example, the length of reduction axis must be a
 multiple of 32 for fp16 multiplicand case, we will update this later.
 
+Temporary workspace arenas
+--------------------------
+
+The public APIs using the generic arena contract expose keyword-only
+`tmp=None`. They include the three reduce APIs and `T.tile.broadcast`, `sort`,
+`merge_sort`, `topk`, `gather_mask`, `select`, `gather`, `sigmoid`, `sin`,
+`cos`, `pow`, `bitwise_xor`, `clamp`, `clamp_max`, `clamp_min`, `round`, the
+deprecated `bilinear_interpolation`, `reduce_sum_experiment`, and
+`reduce_sum_mask_experiment`. PTO does not support `bilinear_interpolation`,
+`sin`, `cos`, or either experimental ReduceSum API.
+
+Omitting `tmp` requests compiler-managed allocation for that call.
+
+An explicit `tmp` supplies the complete target-specific byte arena for one
+call. Its backing Buffer must be one-dimensional, static, contiguous, use a
+fixed-width scalar dtype, and be in `shared.ub`; a BufferRegion must meet the
+same requirements, lie within that Buffer, and start at a 32-byte-aligned byte
+address. The dtype defines byte geometry only. Lowering creates the target's
+typed views over the same bytes without numeric conversion.
+
+The frontend validates structure and alignment. A2/A3 AscendC static FP32
+last-axis reductions use the same planner for allocation and the device helper;
+lowering rejects undersized explicit arenas. Other target paths retain their
+existing capacity rules, and callers must provide enough storage. There is no
+public size-query API. A zero-extent arena is valid only when the selected
+path consumes no workspace and lowering removes the operand.
+
+This UB scratch arena is unrelated to `workspace_idx`, which declares
+runtime-allocated GM tensors in a JIT function signature.
+
 T.reduce_sum / T.reduce_max / T.reduce_min
 -----------------------------------------
 
-args: src, dst, dim=-1, clear=True, real_shape=None
+args: src, dst, dim=-1, *args, clear=True, real_shape=None, tmp=None
 
 Performs an Ascend fast-path reduce operation from src to dst on
 dimension dim.
@@ -85,6 +113,113 @@ dimension dim.
   `[physical_cols]` or `[1, physical_cols]`.
 - The frontend rejects invalid axes, invalid `real_shape`, and invalid
   output shapes before lowering to the backend.
+- `tmp` follows the generic arena contract above. Omit it unless the required
+  capacity is known for the selected target path.
+
+<a id="static-fp32-row-reductions"></a>
+
+### Static FP32 row reductions
+
+These requirements apply to A2/A3 AscendC static FP32 `reduce_sum`, `reduce_max`,
+and `reduce_min` over the last dimension. Other platforms, backends, dtypes, and
+axes retain their existing implementations.
+
+#### Logical width and physical pitch
+
+For an input stored in UB, `M` is the logical row count, `N` is the number of
+participating values per row, and `S` is the physical distance between row
+starts, in FP32 elements. All three must be compile-time constants:
+
+```text
+M > 0, N > 0, S >= N, M == 1 or S % 8 == 0
+```
+
+Unaligned multirow inputs fail during lowering. `N` need not be divisible by
+eight: use `real_shape` to exclude padding already present in the source:
+
+```python
+src = T.alloc_ub((31, 96), "float32")
+dst = T.alloc_ub((31,), "float32")
+T.reduce_max(src, dst, dim=-1, real_shape=[31, 95], clear=True)
+```
+
+Only the first 95 elements of each row contribute. `clear=True` assigns the
+result; `clear=False` combines it with an initialized destination using the
+same operation (max, min, or addition).
+
+#### Buffers and temporary space
+
+Prefer complete UB buffers. Source, destination, and scratch must have
+32-byte-aligned, nonoverlapping bases and own these physical spans:
+
+| Buffer | Required FP32 elements | Access |
+| --- | ---: | --- |
+| Source | `AlignUp(M * S, 8)` | Read-only |
+| Destination | `AlignUp(M, 8)` | Writable, including padding |
+| Scratch | Shared planner's reported requirement | Fully clobberable |
+
+The logical destination contains only `M` results. A source padding block may
+be read to form an intermediate result, but that result cannot contribute to
+the logical reduction. Invalid lanes of the last logical block are masked.
+
+Memory planning aligns allocation bases and total spans; it does not pad
+individual source rows. Embedded regions require the caller to prove base
+alignment, ownership of destination padding, and absence of aliases.
+
+Omit `tmp` for automatic allocation. An explicit `tmp` must be a static,
+contiguous, one-dimensional UB arena with enough bytes and an aligned start.
+Lowering creates the required FP32 view and rejects insufficient capacity.
+There is no public Python scratch-size query.
+
+The shared planner checks instruction-field representability and the
+helper-local UB footprint. The kernel must also fit every other live UB
+allocation within the 196352-byte planner budget. Unsupported static plans
+fail during lowering instead of selecting a runtime fallback.
+
+See the [compiler design](../ascend/row_reduce.md) for instruction selection,
+intermediate layouts, and synchronization within the helper.
+
+T.tile.broadcast
+----------------
+
+args: dst, src, axis=None, *, tmp=None
+
+Broadcasts a one- or two-dimensional UB source into a compatible UB
+destination. `axis` may be `0`, `1`, or omitted for static shape inference.
+The optional keyword-only `tmp` uses the same explicit-arena structural and
+alignment rules as the reduce APIs; nonzero capacity remains the caller's
+responsibility. PTO broadcast needs no workspace, so an explicit zero-length
+arena is accepted and omitted during lowering.
+
+T.tile.row_expand_*_experiment
+------------------------------
+
+`row_expand_mul_experiment`, `row_expand_sub_experiment`, and
+`row_expand_div_experiment` apply one scalar per row. They are experimental
+APIs with a specialized `tmp` contract, not the generic byte-arena contract
+above.
+
+```text
+dst[i, j] = src0[i, j] * src1[i]  # mul
+dst[i, j] = src0[i, j] - src1[i]  # sub
+dst[i, j] = src0[i, j] / src1[i]  # div
+```
+
+- `dst`, `src0`, and `src1` have matching `float16` or `float32` dtype.
+- Leading dimensions of `dst` and `src0` fold into a static row count in
+  `8..248`, divisible by 8. Each logical row is 256 bytes: 128 fp16 or 64 fp32
+  elements.
+- The backing last dimensions of `dst` and `src0` are static 32-byte multiples
+  that encode the same `1..255`-block row stride. Every operand access offset
+  is 32-byte aligned.
+- Without `tmp`, `src1` is `[rows, lanes_per_32B]` and each row already contains
+  a replicated scalar.
+- With `tmp`, `src1` is `[rows]`, `[rows, 1]`, or `[1, rows]`; `tmp` has the
+  operand dtype and exactly `rows * lanes_per_32B` contiguous elements.
+
+For BufferRegion operands, the frontend rejects outer-dimension folds it
+cannot prove contiguous. Use dense row-major backing buffers; explicit Buffer
+strides are outside this experimental contract.
 
 T.Parallel
 ----------

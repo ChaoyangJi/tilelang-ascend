@@ -6,7 +6,7 @@ from numbers import Integral
 from tvm import ir, tir
 from tvm.tir import Buffer, BufferRegion, PrimExpr
 
-from .ascend import _dtype, _retrieve_shape
+from .ascend import _dtype, _get_tmp_arena_access_ptr, _retrieve_shape
 
 _REDUCE_KWARG_SENTINEL = object()
 
@@ -266,8 +266,9 @@ def _reduce_with_clear(
     dim: int,
     clear: bool,
     real_shape: list[int] | None,
+    tmp: Buffer | BufferRegion | None = None,
 ):
-    return reduce(buffer, out, reduce_type, dim, real_shape, clear=clear)
+    return reduce(buffer, out, reduce_type, dim, real_shape, clear=clear, tmp=tmp)
 
 
 def reduce(
@@ -277,9 +278,12 @@ def reduce(
     dim: int,
     real_shape: list[int] = None,
     clear: bool = True,
+    tmp: Buffer | BufferRegion | None = None,
 ):
     """Emit the Ascend fast-path reduce intrinsic for buffers or buffer regions."""
     dtype = _dtype(buffer)
+    if dtype == "float" and dim == -1 and _dtype(out) != dtype:
+        raise TypeError(f"Ascend row reduce source and destination dtypes must match, got {dtype} and {_dtype(out)}")
 
     def _handle_buffer_region(br: BufferRegion, mask):
         bf = br.buffer
@@ -337,12 +341,10 @@ def reduce(
     if isinstance(src_buffer, Buffer) and len(src_buffer.shape) >= 1:
         physical_row = src_buffer.shape[-1]
 
-    args = [
-        f"{reduce_type}<{dtype}, {shape}, {dim}>",
-        out_ptr,
-        buffer_ptr,
-        tir.const(clear, "bool"),
-    ]
+    args = [f"{reduce_type}<{dtype}, {shape}, {dim}>", out_ptr, buffer_ptr]
+    if tmp is not None:
+        args.append(_get_tmp_arena_access_ptr(reduce_type, tmp))
+    args.append(tir.const(clear, "bool"))
     # Attached only once every extent involved is a constant: the codegen has to
     # read them back out of the template parameters to size the stride, and a
     # symbolic one there has nothing it can do.
@@ -366,23 +368,43 @@ def reduce_max(
     *args,
     clear=_REDUCE_KWARG_SENTINEL,
     real_shape=_REDUCE_KWARG_SENTINEL,
+    tmp: Buffer | BufferRegion | None = None,
 ):
     """Perform a max reduction on the current Ascend fast-path.
 
+    Supports float16 and float32 on Ascend A2/A3.
+
     Args:
-        buffer: The source buffer or buffer region.
-        out: The destination buffer or buffer region.
+        buffer: The source buffer or buffer region. Must be in UB (``T.alloc_ub``).
+        out: The destination buffer or buffer region. Must be in UB.
         dim: Reduce axis for the supported fast-path ranks. 1D buffers support
             0/-1, 2D buffers support 0/1/-1/-2, and 3D buffers only support
             the trailing tile axes 0/1/-1/-2.
         *args: Optional positional compatibility arguments for ``clear`` and
             ``real_shape``.
-        clear: Whether to initialize ``out`` before reduction.
+        clear: Compile-time bool. True assigns the reduction; False merges
+            with an already initialized ``out``.
         real_shape: Optional logical 2D shape for sliced UB tiles.
+        tmp: Optional complete target-specific scratch storage. It must be a
+            one-dimensional, static, contiguous fixed-width scalar buffer in
+            ``shared.ub``, or an equivalent 32-byte-aligned buffer region. Its
+            dtype is ignored and lowering reinterprets the storage by byte address.
+            Zero extent is allowed for backend paths that need no workspace.
+            AscendC fp32 last-axis reductions use the exact Reduce2D scratch
+            requirement and reject undersized explicit arenas. Other paths
+            retain their existing target-specific capacity rules.
     """
     parsed_clear, parsed_real_shape = _parse_reduce_optional_args("reduce_max", args, clear=clear, real_shape=real_shape)
     legalized_dim = _legalize_reduce_dim(_get_buffer_extent(buffer), dim)
-    return _reduce_with_clear(buffer, out, "reduce_max", legalized_dim, parsed_clear, parsed_real_shape)
+    return _reduce_with_clear(
+        buffer,
+        out,
+        "reduce_max",
+        legalized_dim,
+        parsed_clear,
+        parsed_real_shape,
+        tmp=tmp,
+    )
 
 
 def reduce_min(
@@ -392,23 +414,43 @@ def reduce_min(
     *args,
     clear=_REDUCE_KWARG_SENTINEL,
     real_shape=_REDUCE_KWARG_SENTINEL,
+    tmp: Buffer | BufferRegion | None = None,
 ):
     """Perform a min reduction on the current Ascend fast-path.
 
+    Supports float16 and float32 on Ascend A2/A3.
+
     Args:
-        buffer: The source buffer or buffer region.
-        out: The destination buffer or buffer region.
+        buffer: The source buffer or buffer region. Must be in UB (``T.alloc_ub``).
+        out: The destination buffer or buffer region. Must be in UB.
         dim: Reduce axis for the supported fast-path ranks. 1D buffers support
             0/-1, 2D buffers support 0/1/-1/-2, and 3D buffers only support
             the trailing tile axes 0/1/-1/-2.
         *args: Optional positional compatibility arguments for ``clear`` and
             ``real_shape``.
-        clear: Whether to initialize ``out`` before reduction.
+        clear: Compile-time bool. True assigns the reduction; False merges
+            with an already initialized ``out``.
         real_shape: Optional logical 2D shape for sliced UB tiles.
+        tmp: Optional complete target-specific scratch storage. It must be a
+            one-dimensional, static, contiguous fixed-width scalar buffer in
+            ``shared.ub``, or an equivalent 32-byte-aligned buffer region. Its
+            dtype is ignored and lowering reinterprets the storage by byte address.
+            Zero extent is allowed for backend paths that need no workspace.
+            AscendC fp32 last-axis reductions use the exact Reduce2D scratch
+            requirement and reject undersized explicit arenas. Other paths
+            retain their existing target-specific capacity rules.
     """
     parsed_clear, parsed_real_shape = _parse_reduce_optional_args("reduce_min", args, clear=clear, real_shape=real_shape)
     legalized_dim = _legalize_reduce_dim(_get_buffer_extent(buffer), dim)
-    return _reduce_with_clear(buffer, out, "reduce_min", legalized_dim, parsed_clear, parsed_real_shape)
+    return _reduce_with_clear(
+        buffer,
+        out,
+        "reduce_min",
+        legalized_dim,
+        parsed_clear,
+        parsed_real_shape,
+        tmp=tmp,
+    )
 
 
 def reduce_sum(
@@ -418,20 +460,46 @@ def reduce_sum(
     *args,
     clear=_REDUCE_KWARG_SENTINEL,
     real_shape=_REDUCE_KWARG_SENTINEL,
+    tmp: Buffer | BufferRegion | None = None,
 ):
     """Perform a sum reduction on the current Ascend fast-path.
 
+    Supports float16 and float32 on Ascend A2/A3. Note: float16 sum may
+    overflow when results exceed 65504.
+
     Args:
-        buffer: The source buffer or buffer region.
-        out: The destination buffer or buffer region.
+        buffer: The source buffer or buffer region. Must be in UB (``T.alloc_ub``).
+        out: The destination buffer or buffer region. Must be in UB.
         dim: Reduce axis for the supported fast-path ranks. 1D buffers support
             0/-1, 2D buffers support 0/1/-1/-2, and 3D buffers only support
             the trailing tile axes 0/1/-1/-2.
         *args: Optional positional compatibility arguments for ``clear`` and
             ``real_shape``.
-        clear: Whether to initialize ``out`` before reduction.
+        clear: Compile-time bool. True assigns the reduction; False merges
+            with an already initialized ``out``.
         real_shape: Optional logical 2D shape for sliced UB tiles.
+        tmp: Optional complete target-specific scratch storage. It must be a
+            one-dimensional, static, contiguous fixed-width scalar buffer in
+            ``shared.ub``, or an equivalent 32-byte-aligned buffer region. Its
+            dtype is ignored and lowering reinterprets the storage by byte address.
+            Zero extent is allowed for backend paths that need no workspace.
+            AscendC fp32 last-axis reductions use the exact Reduce2D scratch
+            requirement and reject undersized explicit arenas. Other paths
+            retain their existing target-specific capacity rules.
+
+    Note:
+        On the AscendC backend, float16 ``reduce_sum`` lowers through a
+        float32 widening (Cast -> ReduceSum<float> -> Cast), so the reduction
+        accumulates in float32 precision and rounds once at the end.
     """
     parsed_clear, parsed_real_shape = _parse_reduce_optional_args("reduce_sum", args, clear=clear, real_shape=real_shape)
     legalized_dim = _legalize_reduce_dim(_get_buffer_extent(buffer), dim)
-    return _reduce_with_clear(buffer, out, "reduce_sum", legalized_dim, parsed_clear, parsed_real_shape)
+    return _reduce_with_clear(
+        buffer,
+        out,
+        "reduce_sum",
+        legalized_dim,
+        parsed_clear,
+        parsed_real_shape,
+        tmp=tmp,
+    )

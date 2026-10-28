@@ -189,7 +189,9 @@ TileLang还支持JIT（Just-in-time，即时编译）。JIT是一种动态编译
 - NPU硬件约束下的AscendC语法修正。JIT在运行时可检测当前NPU硬件的资源配置，严格遵守硬件资源限制，指导CodeGen生成符合性能约束的AscendC代码。
 - 算子运行时的即时编译与动态优化。算子运行过程中，JIT会在编译过程中结合NPU当前的硬件状态优化指令分配，根据AI Core的利用率和内存占用情况动态调整编译策略。
 
-在TileLang kernel开发中，通过 **@jit** 装饰器来触发调用时的即时编译。
+在TileLang kernel开发中，通过 **@jit** 装饰器来触发调用时的即时编译。需要为单个
+kernel 传递毕昇编译选项时，使用 `compile_flags`，不要修改进程级环境变量。参数优先级、
+缓存行为和调试示例见 [JIT compilation on Ascend](tutorials/jit_compilation.md)。
 
 ### 2.4 A5 Camodel 仿真运行
 
@@ -292,40 +294,20 @@ def add_kernel(
     ...  # kernel body
 ```
 
-shape除了可以是整形常量外，还可以是符号变量的形式表示，以支持动态信息传递。在TileLang中，支持两种符号变量的形式：
+shape除了可以是整形常量外，还可以使用 `T.symbolic(name, dtype)` 创建的符号变量：
 
-- **T.dyn[...]**
+```
+K = T.symbolic("K", "int32")
 
-  这种方式对于符号变量的使用，在kernel体内通过buffer的shape信息来获取和使用。
-
-  ```
-  # 1) Annotation-only symbol; read the bound size via shape
-  K = T.dyn['K']  # dtype defaults to int32
-  @T.prim_func
-  def foo(A: T.Tensor((K,), 'float32')):
-      N = A.shape[0]
-      for i in T.serial(N):
-          ...
-  ```
-
-  
-
-- **T.dynamic(name, dtype)**
-
-   这种方式创建一个tir.Var，然后可以直接在后续的表达式和循环语句中使用该符号。
-
-  ```
-  # 2) Explicit Var symbol usable in the body
-  K = T.dynamic('K', 'int32')   # or T.dynamic('K') defaults to int32
-  @T.prim_func
-  def bar(A: T.Tensor((K,), 'float32')):
-      for i in T.serial(K):
-          ...
-  ```
+@T.prim_func
+def foo(A: T.Tensor((K,), "float32")):
+    for i in T.serial(A.shape[0]):
+        ...
+```
 
 注意：
 
-- T.symbolic(name, dtype) 是T.dynamic的一个已弃用的别名；建议使用T.dynamic。
+- 当前公开接口是 `T.symbolic`；`T.dyn` 和 `T.dynamic` 不由 `tilelang.language` 导出。
 - 在 `@jit`中, 具体的尺寸来自第一次调用时传入的实际张量参数.
 - 注解中的符号不需要作为单独的kernel参数；TileLang 会从参数形状中绑定它们。
 
@@ -341,15 +323,26 @@ float16, float32, bfloat16, int8, int16, int32, int64, uint8, uint16, uint32, ui
 
 ### 3.3 kernel launch
 
-**with T.Kernel(...)** 声明一个kernel运行上下文，并且创建数据tile block与逻辑核的绑定关系。对于Ascend NPU来说，对于每个block，返回一个（cid，vid)的元组。cid的范围为 [0,block_num), vid的范围为0或1。因为A2/A3的CV核配比可以为1:2或1:1, 可以通过vid指定当前vector的索引。
+**with T.Kernel(...)** 声明 kernel 运行上下文，并创建数据 tile block 与逻辑核的绑定。
+Ascend 只接受一个 block 维度。Expert 形式省略 `threads` 并返回 `(cid, vid)`；Developer
+形式显式设置 `threads=1` 或 `2`，只返回 `cid`：
 
-下面的代码片段对于(M, N)大小的数据块，切分为（block_M，block_N）大小的基本tile block，tile block的数量为m_num * n_num个，代码逻辑可以理解为多个并发的执行单元，每个单元处理一个tile block（针对每个tile block，又可以根据vector数量切分为1个或2个vector单元并发处理）。
+```python
+# Expert
+with T.Kernel(block_num, is_npu=True) as (cid, vid):
+    ...
+
+# Developer / Hybrid
+with T.Kernel(block_num, threads=2, is_npu=True) as cid:
+    ...
+```
+
+`cid` 的范围为 `[0, block_num)`。多维任务应折叠成 `block_num`，再在 kernel 内从
+`cid` 恢复逻辑索引：
 
 ```
 m_num = M // block_M
 n_num = N // block_N
-VEC_NUM = 2
-
 @T.prim_func
 def main(A: T.Tensor((M, N), dtype),
          B: T.Tensor((M, N), dtype),
@@ -639,6 +632,13 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
 
 #### 4.1.3 计算原语
 
+**计算原语的 UB 临时空间**
+
+需要 scratch storage 的计算原语可省略 `tmp`，由编译器管理 UB；Expert 模式也可用关键字
+`tmp=` 为单次调用提供显式 arena。这里的 UB scratch 与 `workspace_idx` 声明的 runtime GM
+workspace 是两种不同机制。显式 arena 的结构、对齐、容量责任和支持 API 见
+[TileLibrary language reference](language_ref/tilelibrary.md)。
+
 ##### 4.1.3.1 矩阵计算
 
 - `T.gemm_v0(A, B, C, transpose_A=False, transpose_B=False, init=False, kL0Size=128):`
@@ -698,8 +698,11 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
 - 对 2D slice buffer 且设置了 `real_shape` 的兼容路径，`out` 还允许保持部分 physical-layout 形式，例如 `[physical_cols]` 或 `[1, physical_cols]`；这是为了兼容当前后端对 slice buffer 的 lowering 方式。
 - 非法 `dim`、非法 `real_shape`、非法 `out` shape 会在前端直接报错，而不是静默进入后端。
 - `clear` 和 `real_shape` 同时支持关键字传参和兼容的 positional 传参形式，建议优先使用关键字形式以获得更清晰的可读性。
+- `tmp` 是可选的 keyword-only UB scratch arena；省略时由编译器管理，只影响当前调用。
+- 显式 arena 的结构和对齐由前端检查，非零容量由调用者负责；完整契约见
+  [TileLibrary language reference](language_ref/tilelibrary.md)。
 
-- `T.reduce_sum(buffer: Buffer, out: Buffer, dim: int = -1, clear: bool = True, real_shape: list[int] | None = None)`
+- `T.reduce_sum(buffer: Buffer, out: Buffer, dim: int = -1, *args, clear: bool = True, real_shape: list[int] | None = None, tmp: Buffer | BufferRegion | None = None)`
 
   **参数**：
 
@@ -708,6 +711,7 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
   - dim：reduce轴
   - clear：是否在计算前清空输出buffer
   - real_shape：2D slice buffer 的逻辑有效范围
+  - tmp：可选的完整 target-specific UB scratch arena，仅允许关键字传入
 
   **功能说明**：
 
@@ -737,7 +741,14 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
   T.reduce_sum(acc_s_ub, sumexp_i_ub, dim=-1, clear=False)
   ```
 
-- `T.reduce_max(buffer: Buffer, out: Buffer, dim: int = -1, clear: bool = True, real_shape: list[int] | None = None)`
+  保守分配显式 arena 的示例（允许大于 target 的实际需求）：
+
+  ```
+  reduce_tmp_ub = T.alloc_ub((64 * 1024,), "uint8")
+  T.reduce_sum(acc_s_ub, sumexp_i_ub, dim=-1, tmp=reduce_tmp_ub)
+  ```
+
+- `T.reduce_max(buffer: Buffer, out: Buffer, dim: int = -1, *args, clear: bool = True, real_shape: list[int] | None = None, tmp: Buffer | BufferRegion | None = None)`
 
   **参数**：
 
@@ -746,6 +757,7 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
   - dim：reduce轴
   - clear：是否在计算前清空输出buffer
   - real_shape：2D slice buffer 的逻辑有效范围
+  - tmp：可选的完整 target-specific UB scratch arena，仅允许关键字传入
 
   **功能说明**：
 
@@ -773,7 +785,7 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
   T.reduce_max(in_shared, out_shared, dim=-1, real_shape=[4, 4])
   ```
 
-- `T.reduce_min(buffer: Buffer, out: Buffer, dim: int = -1, clear: bool = True, real_shape: list[int] | None = None)`
+- `T.reduce_min(buffer: Buffer, out: Buffer, dim: int = -1, *args, clear: bool = True, real_shape: list[int] | None = None, tmp: Buffer | BufferRegion | None = None)`
 
   **参数**：
 
@@ -782,6 +794,7 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
   - dim：reduce轴
   - clear：是否在计算前清空输出buffer
   - real_shape：2D slice buffer 的逻辑有效范围
+  - tmp：可选的完整 target-specific UB scratch arena，仅允许关键字传入
 
   **功能说明**：
 
@@ -855,7 +868,20 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
 
   从这三张图可以看出，`clear=False` 并不会改变 reduce 轴本身的定义，也不会改变输出 shape 的约束；它只是在 reduce 结果生成之后，再根据操作类型执行一次额外的 merge。
 
-##### 4.1.3.3 Element-wise math类
+##### 4.1.3.3 Broadcast类
+
+- `T.tile.broadcast(dst: Buffer | BufferRegion, src: Buffer | BufferRegion, axis: int | None = None, *, tmp: Buffer | BufferRegion | None = None)`
+
+  `T.tile.broadcast` 在 UB 中把 `src` 广播到 `dst`。`axis` 可以显式指定为 `0` 或 `1`，也可以留空由静态 shape 推断。
+
+  `tmp` 与 reduce 的显式 arena 使用同一结构约束：一维、静态、连续、具有任意定宽标量 dtype 的 `shared.ub` Buffer，或起始字节地址 32B 对齐的同类 BufferRegion。dtype 仅决定元素数到字节容量和地址的换算，lowering 会将存储 reinterpret 为目标所需类型。`tmp` 仅允许关键字传入。PTO broadcast 不需要 workspace，因此可以省略 `tmp`，也可以传入零长度 arena；lowering 不会生成零尺寸 Tensor 或内存访问。AscendC broadcast 的显式容量当前由调用者负责，建议保守地过量分配。
+
+  ```
+  broadcast_tmp_ub = T.alloc_ub((64 * 1024,), "uint8")
+  T.tile.broadcast(dst_ub, src_ub, axis=1, tmp=broadcast_tmp_ub)
+  ```
+
+##### 4.1.3.4 Element-wise math类
 
 TileLang提供了多种元素级操作算符，并结合调度原语**T.Parallel**实现Element-wise类的操作。目前支持的元素级别操作如下：
 
@@ -1419,8 +1445,8 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 | ---------- | ---------------------------------------- | ------------------------------------------------------------ |
 | 加法       | T.tile.add(dst, src0, src1)              | element-wise加法，dst = src0 + src1                          |
 | 减法       | T.tile.sub(dst, src0, src1)              | element-wise减法，dst = src0 - src1                          |
-| 乘法       | T.tile.mul(dst, src0, src1)              | element-wise法乘，dst = src0 * src1                          |
-| 除法       | T.tile.div(dst, src0, src1)              | element-wise法乘，dst = src0 / src1                          |
+| 乘法       | T.tile.mul(dst, src0, src1)              | element-wise乘法，dst = src0 * src1                          |
+| 除法       | T.tile.div(dst, src0, src1)              | element-wise除法，dst = src0 / src1（仅支持浮点 dtype）      |
 | 最大值     | T.tile.max(dst, src0, src1)              | element-wise 求max，dst = max(src0, src1)                    |
 | 最小值     | T.tile.min(dst, src0, src1)              | element-wise 求min，dst = min(src0, src1)                    |
 | 指数       | T.tile.exp(dst, src0)                    | element-wise 取自然指数，dst = exp(src0)                     |
@@ -1448,11 +1474,13 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 
   **参数**：
 
-  - dst：计算结果存放目的buffer
+  - dst：计算结果存放目的buffer，可与 src0/src1 别名（原地运算）
   - src0: 操作数1，数据类型为buffer类型
   - src1: 操作数2，数据类型可以为buffer类型，也可以是scalar类型
 
   **功能**：element-wise加法，dst = src0 + src1
+
+  **支持类型**：float16、float32、int16、int32（dst/src0/src1 必须一致）
 
   **举例**：
 
@@ -1468,11 +1496,13 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 
   **参数**：
 
-  - dst：计算结果存放目的buffer
-  - src0: 操作数1，数据类型为buffer类型
-  - src1: 操作数2，数据类型可以为buffer类型，也可以是scalar类型
+  - dst：计算结果存放目的buffer，可与 src0/src1 别名（原地运算）
+  - src0: 操作数1（被减数），数据类型为buffer类型
+  - src1: 操作数2（减数），数据类型可以为buffer类型，也可以是scalar类型
 
   **功能**：element-wise减法，dst = src0 - src1
+
+  **支持类型**：float16、float32、int16、int32（dst/src0/src1 必须一致）
 
   **举例**：
 
@@ -1488,11 +1518,13 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 
   **参数**：
 
-  - dst：计算结果存放目的buffer
+  - dst：计算结果存放目的buffer，可与 src0/src1 别名（原地运算）
   - src0: 操作数1，数据类型为buffer类型
   - src1: 操作数2，数据类型可以为buffer类型，也可以是scalar类型
 
-  **功能**：element-wise法乘，dst = src0 * src1
+  **功能**：element-wise乘法，dst = src0 * src1
+
+  **支持类型**：float16、float32、int16、int32（dst/src0/src1 必须一致）
 
   **举例**：
 
@@ -1508,11 +1540,13 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 
   **参数**：
 
-  - dst：计算结果存放目的buffer
-  - src0: 操作数1，数据类型为buffer类型
-  - src1: 操作数2，数据类型可以为buffer类型，也可以是scalar类型
+  - dst：计算结果存放目的buffer，可与 src0/src1 别名（原地运算）
+  - src0: 操作数1（被除数），数据类型为buffer类型
+  - src1: 操作数2（除数），数据类型可以为buffer类型，也可以是scalar类型
 
-  **功能**：element-wise法乘，dst = src0 / src1
+  **功能**：element-wise除法，dst = src0 / src1
+
+  **支持类型**：仅 float16、float32（整数 dtype 不支持）；scalar 除法通过乘以倒数实现，非 2 的幂次除数有额外舍入误差
 
   **举例**：
 
@@ -2037,28 +2071,22 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   - `dst`与 `src` 数据类型相同，仅支持float32和float16数据类型
   - `src` 的大小需要满足32或32的整数倍
 
-- `T.tile.merge_sort(dst, src0, src1, src2=None, src3=None):`
+- `T.tile.merge_sort(dst, src0, src1, src2=None, src3=None, tmp=None):`
 
   **参数**：
 
   - dst：归并结果输出缓冲区
-  - tmp：临时缓冲区，用于归并计算的中间结果存储
   - src0：第一个已排序的源数据缓冲区
   - src1：第二个已排序的源数据缓冲区
   - src2：第三个已排序的源数据缓冲区（可选，3-way 或 4-way 归并时需要）
   - src3：第四个已排序的源数据缓冲区（可选，4-way 归并时需要）
+  - tmp：可选临时缓冲区（ascendc 后端不使用；pto 后端不传时自动分配，显式传入须为非空 buffer）
 
   **功能**：将多个已排序的数据块合并为一个有序结果，支持 2-way、3-way 和 4-way 归并排序。
 
-  **数据格式**：输入/输出格式均为 value-index pair：`[value0, index0, value1, index1, value2, index2, ...]`，按降序排列。
-
-  数据类型为float，每个结构占据8Bytes：
+  **数据格式**：输入/输出格式均为 value-index pair：`[value0, index0, value1, index1, value2, index2, ...]`，按降序排列。数据类型为 float32，每个结构（value + index）占据 8 Bytes：
 
   ![image-tilelang_ascend_mergesort2](./images/zh-cn_image_0000002449970177.png)
-
-  数据类型为half，每个结构也占据8Bytes，中间有2Bytes保留：
-  
-  ![image-tilelang_ascend_mergesort2](./images/zh-cn_image_0000002449890293.png)
 
   **举例**：
 
@@ -2074,12 +2102,12 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   ```
 
   **注意事项**：
-  - `tmp` 缓冲区大小需与 `dst` 相同
+  - 目前仅支持 `float32`，不支持 `float16`
   - 输入缓冲区必须已按降序排序
   - 所有缓冲区的数据格式必须为 value-index pair（每 2 个 float 表示一个元素）
+  - dst 大小至少为所有 src 大小之和
+  - pto 后端要求各 src 大小相同（不等长归并仅 ascendc 支持）
   - 建议配合 `T.tile.sort32` 一起使用
-
-  更详细说明，详见AscendC文档：https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/API/ascendcopapi/atlasascendc_api_07_0232.html
 
 - `T.tile.topk(dst, src, K, actual_num):`
 
@@ -2248,6 +2276,10 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 
   详细功能，详见AscendC文档：https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/API/ascendcopapi/atlasascendc_api_07_0270.html
 
+旧的 `T.init_flag` / `T.clear_flag` 已删除：它们只对 AscendC 字符串 codegen 生效，PTO
+会静默忽略。读取旧代码时应迁移到结构化同步 API；新 Expert kernel 遵循项目当前要求的
+同步抽象。
+
 - `T.barrier_all():`
 
   **参数**：
@@ -2257,6 +2289,9 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   **功能**：为所有流水线阶段插入一个屏障。
 
   详细功能，详见AscendC文档：https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/API/ascendcopapi/atlasascendc_api_07_0271.html
+
+  **边界**：该屏障只等待它之前已经发出的本地异步操作。它不等价于缓冲区
+  ownership handoff，也不能保护屏障之后的 store，防止后续 task 复用同一物理缓冲。
 
 - `T.pipe_barrier(pipe: _pipe):`
 
@@ -2278,6 +2313,32 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 
   详细功能，详见AscendC文档：https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/API/ascendcopapi/atlasascendc_api_07_0204.html
 
+手动同步并复用同一物理缓冲时，应为 producer → consumer 的“数据就绪”和
+consumer → producer 的“缓冲归还”分别使用匹配的 `set_flag` / `wait_flag`：
+
+1. 若 producer 的首次写需要初始 ownership，由 consumer 在入口预先归还 token；
+2. producer 获取 token、写缓冲，并在异步写完成后通知 consumer；
+3. consumer 获取 token，持有到最后一次读取完成，并在下一次 producer 复用前归还；
+4. 退出前消费所有已初始化槽位尚未消费的 token，包括未使用槽位的初始 token 和最终归还的 token。
+
+TileLang 的核内事件和核间通知均须在初始化、循环、分支和退出路径上保持 Set/Wait 配对。
+核间配对按同步模式的参与核及发送/接收关系判断，而非简单比较所有核的调用总数。
+可以省去不再需要的最终 Set，但不能留下未消费通知，也不能删除数据依赖或缓冲复用所需的 Wait。
+
+在已确认的 A2/A3 运行路径上，不再承担后续依赖的末尾核间通知可以不消费；这是平台特定行为，
+不适用于核内事件或仍承担依赖的通知。[官方迁移指南](https://gitcode.com/cann/ops-math/blob/master/docs/zh/develop/cross_platform_migration_guide.md)
+说明 A2 会在算子之间清理多余计数，而 Ascend 950 要求严格配对；A3 的结论仅限已实测路径。
+TileLang 为保持跨平台一致性，统一要求完整配对，`target="ascendc"` 和 `target="pto"` 均无例外。
+未配对的核内事件可能在当前调用中不暴露错误，却影响后续调用或同一芯片上的其他进程。
+**因此，实测通过不能替代配对检查。**
+
+例如，MTE2 写 L1、MTE1 读取后，正向使用 `MTE2 → MTE1`，反向归还使用
+`MTE1 → MTE2`。若 MTE1 在多个内层循环中持续读取该 L1 缓冲，必须在最后一次读取
+之后再归还，而不是在第一次读取后立即归还。
+
+event ID 按有向 pipe pair 分配；反向 pair 是独立编号空间。同一 ownership slot 可在
+两个方向使用相同数字以便审查，但 `FREE`、`READY` 等不同语义仍应保留独立名称。
+
 ## 5. 调试诊断
 
 ### 5.1 调试打印
@@ -2285,7 +2346,17 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
 TileLang-ascend 引入了新的调试接口：T.printf 和 T.dump_tensor。目前支持 Ascend 端的全量转储功能。基本类型、指针、ub_buffer、l1_buffer、l0c_buffer 和 global_buffer 均可打印。
 注意：T.printf 和 T.dump_tensor 是设备端的调试工具；对于主机端，请直接使用 Python 内置的 print 即可。
 
-**环境配置**：要使 T.printf 和 T.dump_tensor 的输出在运行时生效，需要在编译时启用调试打印支持。设置环境变量 `TL_PTO_DEBUG=1` 后，编译器会追加 `-D_DEBUG` 和 `--cce-enable-print` 编译选项，开启设备端 printf 功能：
+**编译配置**：要使 T.printf 和 T.dump_tensor 的输出在运行时生效，需要在编译时启用
+调试打印支持。优先用 kernel-scoped `compile_flags`：
+
+```python
+@tilelang.jit(target="ascendc", compile_flags=["-D_DEBUG", "--cce-enable-print"])
+def debug_kernel(...):
+    ...
+```
+
+`TL_PTO_DEBUG=1` 仅对 `target="pto"` 是兼容的进程级设置；它不会为
+AscendC 后端启用调试 flags：
 
 ```bash
 TL_PTO_DEBUG=1 python your_script.py

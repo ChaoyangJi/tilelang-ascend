@@ -26,12 +26,10 @@ Step 1: 基线采集（性能 + 精度）
 
 - **优化指南**：[optimization-guide.md](references/optimization-guide.md)
 - **反模式清单**：[performance-antipatterns.md](references/performance-antipatterns.md)
-- **同步原语**：[api-schedule-sync.md](../tilelang-custom-skill/tilelang-api-best-practices/references/api-schedule-sync.md)（set_flag / wait_flag / barrier_all / cross_flag 语义与用法）
 - **API 用法**：[tilelang-api-best-practices](../tilelang-custom-skill/tilelang-api-best-practices/SKILL.md)
 - **编程模式**：[tilelang-programming-model-guide](../tilelang-custom-skill/tilelang-programming-model-guide/SKILL.md)
 - **cube最佳实践**：[cube_optimization_path.md](references/best-practices/cube_optimization_path.md)
 - **vector最佳实践**：[vector-practices/](references/vector-practices/)
-
 ---
 
 ## 执行步骤
@@ -135,7 +133,7 @@ Edit 调用方、dispatch 或 planner 前，再写 `[KERNEL-REUSE-AUDIT]` 复核
 
 | 算子类型 | 文档 | 核心优化技术 |
 |---------|------|-------------|
-| Vector 型 | [RoPE 优化](references/best-practices/rope-developer-mode.md)、[归约遍数融合](references/vector-practices/vector_reduce_pass_fusion.md) | | NPU 内动态生成 Mask、Tile API 向量化、参数简化 |
+| Vector 型 | [RoPE 优化](references/best-practices/rope-developer-mode.md)、[归约遍数融合](references/vector-practices/vector_reduce_pass_fusion.md) | NPU 内动态生成 Mask、Tile API 向量化、参数简化 |
 | Cube 型 | [GEMM Intrinsic](references/best-practices/gemm_intrinsic_optimize.md) | 多缓冲流水线、细粒度 Flag 同步、MMA intrinsic、L0 分块、负载均衡 |
 | CV 融合型 | [Flash Attention](references/best-practices/flash_attn_optimize.md) | num_stages 流水线、批量 Softmax、Cross-core Semaphore、数据布局优化；**多 shape 适配**（BSND 免转置、Sq==1 decode 窄块、加性 mask 屏蔽变长 Skv） |
 
